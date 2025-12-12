@@ -4,6 +4,8 @@ The Variational Quantum Eigensolver (VQE) is one of the most prominent algorithm
 
 This repository contains the core implementations of optimization methods proposed in the manuscripts listed below. The repository is currently under active development. In future updates, we plan to provide **PennyLane-based implementations** of these methods, enabling them to be easily used as APIs in practical VQE workflows. The optimizers implemented in this repository are primarily designed for VQE, but they can also be used for other variational quantum circuit (VQC) tasks.
 
+The molecular datasets used in the examples of this repository, located in the dataset folder, are sourced from the PennyLane Molecules collection: https://pennylane.ai/datasets/collection/qchem
+
 ## Related Papers
 
 The methods implemented (or planned to be implemented) in this repository are based on the following works:
