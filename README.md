@@ -16,6 +16,21 @@ The methods implemented (or planned to be implemented) in this repository are ba
 2. **H-QNG** — *Efficient Hamiltonian-aware Quantum Natural Gradient Descent for Variational Quantum Eigensolvers*  
    arXiv:2511.14511
 
+## Installation
+First, clone the repository and install the required dependencies:
+
+```bash
+git clone https://github.com/sd12321sd/VQC-Optimizer.git
+cd VQC-Optimizer
+pip install -r requirements.txt
+```
+
+Run the following command to verify that the initialization was successful:
+
+```bash
+python examples/h2.py
+```
+
 ## Status
 
 🚧 This repository is under construction.  
