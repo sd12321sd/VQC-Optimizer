@@ -3,3 +3,4 @@ PennyLane_Lightning==0.38.0
 numpy==1.26.4
 matplotlib==3.9.2
 matplotlib-inline==0.1.7
+autoray==0.6.12
