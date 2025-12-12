@@ -2,7 +2,7 @@
 
 The Variational Quantum Eigensolver (VQE) is one of the most prominent algorithms for finding ground states of Hamiltonians on near-term noisy intermediate-scale quantum (NISQ) devices. In VQE, a classical optimizer is used to update the parameters of a variational quantum circuit, and its performance plays a crucial role in determining the accuracy and efficiency of the algorithm. Consequently, designing optimizers that are tailored to variational quantum circuits is essential for improving VQE performance and for unlocking its potential quantum advantage.
 
-This repository contains the core implementations of optimization methods proposed in the manuscripts listed below. The repository is currently under active development. In future updates, we plan to provide **PennyLane-based implementations** of these methods, enabling them to be easily used as APIs in practical VQE workflows.
+This repository contains the core implementations of optimization methods proposed in the manuscripts listed below. The repository is currently under active development. In future updates, we plan to provide **PennyLane-based implementations** of these methods, enabling them to be easily used as APIs in practical VQE workflows. The optimizers implemented in this repository are primarily designed for VQE, but they can also be used for other variational quantum circuit (VQC) tasks.
 
 ## Related Papers
 
