@@ -24,7 +24,7 @@ class HQNGOptimizer:
         eta: float = 0.1,
         lam: float = 1e-6,
         lu: bool = False,
-        rcond: float = 1e-10,
+        rcond: float = 0,
         diff_method: str = "parameter-shift",
         device: Optional[qml.devices.Device] = None,
         cache_term_qnodes: bool = True,

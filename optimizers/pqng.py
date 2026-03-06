@@ -6,16 +6,18 @@ from typing import Callable, List, Optional, Tuple, Union
 class PQNGOptimizer:
     """
     Projective Quantum Natural Gradient (P-QNG) optimizer
-    = H-QNG without coefficients (set all a_r = 1).
 
     Metric:
-        G_ij = sum_{r=1}^v  Tr(∂_i ρ P_r) Tr(∂_j ρ P_r)
-            = sum_{r=1}^v  ∂_i <P_r> ∂_j <P_r>
+        G_ij = sum_r ∂_i <P_r> ∂_j <P_r>
 
-        T = G / (2 * sqrt(v))
+    Normalized metric:
+        T = α G
 
-    Update (with trust-region damping):
-        θ' = θ - η (T + λ I)^{-1} ∇L(θ)
+    default:
+        α = 1 / 2^(n+1)
+
+    Update:
+        θ' = θ - η (T + λ I)^(-1) ∇L(θ)
 
     If lu=True:
         - If energy decreases: accept step, λ ↓
@@ -32,9 +34,10 @@ class PQNGOptimizer:
         rcond: float = 1e-10,
         diff_method: str = "parameter-shift",
         device: Optional[qml.devices.Device] = None,
+        norm_factor: Optional[float] = None,
         cache_term_qnodes: bool = True,
     ):
-        self.qnode = qnode  # ansatz callable (not necessarily a QNode)
+        self.qnode = qnode
         self.device = device
         self.eta = eta
         self.lam = lam
@@ -44,7 +47,10 @@ class PQNGOptimizer:
         self.diff_method = diff_method
         self.cache_term_qnodes = cache_term_qnodes
 
-        # Parse Hamiltonian terms (we only need the Pauli strings P_r)
+        # normalization coefficient α
+        self.norm_factor = norm_factor
+
+        # Parse Hamiltonian terms
         if isinstance(hamiltonian_terms, qml.Hamiltonian):
             self.ops = list(hamiltonian_terms.ops)
         else:
@@ -52,11 +58,8 @@ class PQNGOptimizer:
 
         self.v = len(self.ops)
         if self.v == 0:
-            raise ValueError("P-QNG requires at least one Hamiltonian term (Pauli string).")
+            raise ValueError("P-QNG requires at least one Hamiltonian term.")
 
-        self.norm_factor = 2.0 * np.sqrt(float(self.v))
-
-        # cache: term_index -> QNode returning <P_r>
         self._term_qnodes = {}
 
     # ==========================================================
@@ -76,9 +79,11 @@ class PQNGOptimizer:
 
         lam = self.lam
         T_reg = T + lam * np.eye(d)
+
         T_pinv = np.linalg.pinv(T_reg, rcond=self.rcond)
 
         delta = self.eta * (T_pinv @ grad)
+
         new_theta = theta - delta
         new_cost = float(cost_fn(new_theta, *args, **kwargs))
 
@@ -104,11 +109,11 @@ class PQNGOptimizer:
     def _get_device(self, cost_fn) -> qml.devices.Device:
         if self.device is not None:
             return self.device
+
         dev = getattr(cost_fn, "device", None)
         if dev is None:
             raise ValueError(
-                "PQNGOptimizer requires a PennyLane device. "
-                "Pass device=... to the optimizer, or pass a QNode cost_fn with a .device attribute."
+                "PQNGOptimizer requires a PennyLane device."
             )
         return dev
 
@@ -127,25 +132,36 @@ class PQNGOptimizer:
 
         if self.cache_term_qnodes:
             self._term_qnodes[term_index] = expval_qnode
+
         return expval_qnode
 
     def _pqng_metric(self, theta: np.ndarray, dev) -> np.ndarray:
         """
-        Projective metric:
-            G = sum_r grad(<P_r>) ⊗ grad(<P_r>)
-            T = G / (2*sqrt(v))
+        G = sum_r grad(<P_r>) ⊗ grad(<P_r>)
+        T = α G
         """
+
         n_params = theta.size
         G = np.zeros((n_params, n_params), dtype=float)
 
         for idx, P_r in enumerate(self.ops):
             expval_qnode = self._get_term_qnode(dev, idx, P_r)
-            grad_pr = qml.grad(expval_qnode)(theta)
+            grad_pr = np.asarray(qml.grad(expval_qnode)(theta), dtype=float)
+
             G += np.outer(grad_pr, grad_pr)
 
-        return G / self.norm_factor
-    
+        # default normalization α = 1 / 2^(n+1)
+        if self.norm_factor is None:
+            n_qubits = len(dev.wires)
+            alpha = 1.0 / (2 ** (n_qubits + 1))
+        else:
+            alpha = self.norm_factor
+
+        return alpha * G
+
+
 if __name__ == "__main__":
+
     n_qubits = 4
     dev = qml.device("default.qubit", wires=n_qubits)
 
@@ -161,10 +177,13 @@ if __name__ == "__main__":
     terms = []
     J = 1.0
     h = 0.5
+
     for w in range(n_qubits - 1):
         terms.append((-J, qml.PauliZ(w) @ qml.PauliZ(w + 1)))
+
     for w in range(n_qubits):
         terms.append((-h, qml.PauliX(w)))
+
     H = qml.Hamiltonian([c for c, _ in terms], [op for _, op in terms])
 
     @qml.qnode(dev, interface="autograd")
@@ -177,11 +196,12 @@ if __name__ == "__main__":
         hamiltonian_terms=H,
         eta=1e-3,
         lam=1e-5,
-        lu=True,        
-        device=dev
+        lu=True,
+        device=dev,
     )
 
     theta = 0.1 * np.random.randn(2 * n_qubits)
+
     print(f"Optimizer using device wires: {opt.device.wires}")
 
     for t in range(10):
