@@ -1,159 +1,250 @@
-import pennylane as qml
-from pennylane import numpy as np
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
 
-t1 = time.time()
-
-num_qubit = 12
-dev = qml.device("default.qubit", wires=num_qubit + 1)
-
-
-lih = qml.data.load("qchem", molname="LiH", bondlength=1.57, basis="STO-3G", attributes=["fci_energy", "hamiltonian", "fci_spectrum", "hf_state", "vqe_energy", "vqe_params", "vqe_gates"])
-lih = lih[0]
-lih.fci_energy
-H = lih.hamiltonian
-
-H_list = H.terms()[1]
-v = len(H_list) - 1
-
-gate_templates = []
-initial_params = []
-
-folder_name = f"results_lih"
-
-if not os.path.exists(folder_name):
-    os.makedirs(folder_name)  
+import numpy as onp
+import pennylane as qml
+from pennylane import numpy as np
 
 
-
-def mt_qng(circuit, params, H):
-    mt = mt_fn(params, H)
-    return mt
-
-
-def mt_hqng(circuit, params, H):
-    grad_fn = qml.grad(circuit)
-    mt = 0
-    gradient = 0
-    prefactor = 0
-    coes, terms = H.terms()
-    for k in range(len(terms)):
-        coe = coes[k]
-        term = terms[k]
-        jacobian = qml.math.detach(grad_fn(params, term))
-        gradient = gradient + coe * jacobian
-        mt = mt + np.outer(jacobian, jacobian) * (coe ** 2)
-        prefactor = prefactor + coe * coe
-    return  gradient, mt / (2 * np.sqrt(prefactor))
-
-for gate in lih.vqe_gates:
-    gate_templates.append((type(gate), gate.wires))
-    initial_params.append(gate.parameters[0])  # excitation 门只有一个参数
+NUM_QUBITS = 12
+NUM_STEPS = 100
+NUM_RUNS = 10
+LEARNING_RATE = 0.01
+HQNG_REGULARIZATION = 0.01
+INITIALIZATION_LOW = -onp.pi
+INITIALIZATION_HIGH = onp.pi
+BASE_SEED = 2025
+MAX_WORKERS = min(NUM_RUNS, os.cpu_count() or 1)
+PROGRESS_EVERY = 1
+RESULTS_DIR = Path(__file__).resolve().parent / "result_lih_global"
+DATASET_ROOT = Path(os.environ.get("HQNG_DATASET_ROOT", "/data/shic/datasets"))
+DATASET_CACHE_DIR = DATASET_ROOT / "lih_standard"
 
 
-hf_state = lih.hf_state
+lih = qml.data.load(
+    "qchem",
+    molname="LiH",
+    bondlength=1.57,
+    basis="STO-3G",
+    attributes=[
+        "fci_energy",
+        "hamiltonian",
+        "fci_spectrum",
+        "hf_state",
+        "vqe_energy",
+        "vqe_params",
+        "vqe_gates",
+    ],
+    folder_path=DATASET_CACHE_DIR,
+)[0]
 
-def ansatz(params, wires=list(range(12))):
-    qml.BasisState(hf_state, wires)
-    for i, (GateClass, wires) in enumerate(gate_templates):
-        GateClass(params[i], wires=wires)
+FCI_ENERGY = float(lih.fci_energy)
+HAMILTONIAN = lih.hamiltonian
+HAMILTONIAN_COEFFICIENTS, HAMILTONIAN_TERMS = HAMILTONIAN.terms()
+HAMILTONIAN_COEFFICIENTS = onp.asarray(HAMILTONIAN_COEFFICIENTS)
+HAMILTONIAN_TERMS = tuple(HAMILTONIAN_TERMS)
+HQNG_NORMALIZATION = 2.0 * onp.sqrt(
+    onp.sum(HAMILTONIAN_COEFFICIENTS**2)
+)
 
-@qml.qnode(dev)
-def circuit(params, H, num_qubit=num_qubit):
+HF_STATE = onp.asarray(lih.hf_state).copy()
+NUM_PARAMS = onp.asarray(lih.vqe_params).size
+GATE_TEMPLATES = tuple((type(gate), gate.wires) for gate in lih.vqe_gates)
+lih.close()
+del lih
+
+
+device = qml.device("default.qubit", wires=NUM_QUBITS + 1)
+
+
+def ansatz(params, wires=tuple(range(NUM_QUBITS))):
+    qml.BasisState(HF_STATE, wires=wires)
+    for index, (gate_class, gate_wires) in enumerate(GATE_TEMPLATES):
+        gate_class(params[index], wires=gate_wires)
+
+
+@qml.qnode(device)
+def energy_circuit(params):
     ansatz(params)
-    return qml.expval(H)
+    return qml.expval(HAMILTONIAN)
 
-mt_fn = qml.metric_tensor(circuit, approx="block-diag")
 
-def process(j):
-    np.random.seed() 
-    initial_params = lih.vqe_params + np.random.uniform(-0.1, 0.1, len(lih.vqe_params))
- 
-    print('vg start')
-    params = initial_params
-    initial_value = qml.math.detach(circuit(params, H)).item()
-    value_vg = []
-    value_vg.append(initial_value)
-    param_listvg = []
-    param_listvg.append(params)
-    for i in range(1):
-        grad_fn = qml.grad(circuit)
-        jacobian = qml.math.detach(grad_fn(params, H))
-        params = params -  0.01 * jacobian
-        value_vg.append(qml.math.detach(circuit(params, H)).item())
-        param_listvg.append(params)
-        if i%5 == 0:
-            print(i)
-    value_vg = np.stack(value_vg)
-    np.save(folder_name + f"/value_vg{j}.npy", value_vg)
-    
-    
-    print('qng start')
-    
-    params = initial_params
-    initial_value = qml.math.detach(circuit(params, H).item())
-    value_qng = []
-    value_qng.append(initial_value)
-    param_listqng = []
-    param_listqng.append(params)
-    for i in range(1):
-        mt = mt_qng(circuit, params, H)
-        grad_fn = qml.grad(circuit)
-        jacobian = qml.math.detach(grad_fn(params, H))
-        mt_inv = np.linalg.pinv(mt)
-        grad = qml.math.detach(np.real(np.dot(mt_inv, jacobian)))
-        params = params - 0.01 * grad
-        param_listqng.append(params)
-        value_qng.append(qml.math.detach(circuit(params, H)).item())
-        if i%5 == 0:
-            print(i)
-    value_qng = np.stack(value_qng)
-    np.save(folder_name + f"/value_qng{j}.npy", value_qng)
-    
-    
-    print('hqng start')
-    params = initial_params
-    initial_value = qml.math.detach(circuit(params, H).item())
-    value_hqng = []
-    value_hqng.append(initial_value)
-    param_listhqng = []
-    param_listhqng.append(params)
-    for i in range(1):
-        gradient, mt = mt_hqng(circuit, params, H)
-        I = np.eye(mt.shape[1])
-        lam = 0.1
-        mt_inv = np.linalg.inv(mt + lam * I)
-        grad = qml.math.detach(np.real(np.dot(mt_inv, gradient)))
-        params = params - 0.01 * grad
-        param_listhqng.append(params)
-        value_hqng.append(qml.math.detach(circuit(params, H)).item())
-        if i % 5 == 0:
-            print(i)
-    value_hqng = np.stack(value_hqng)
-    np.save(folder_name + f"/value_hqng{j}.npy", value_hqng)
+@qml.qnode(device)
+def single_observable_circuit(params, observable):
+    ansatz(params)
+    return qml.expval(observable)
+
+
+ENERGY_GRADIENT_FN = qml.grad(energy_circuit, argnum=0)
+QNG_METRIC_FN = qml.metric_tensor(energy_circuit, approx="block-diag")
+SINGLE_TERM_GRADIENT_FN = qml.grad(single_observable_circuit, argnum=0)
+
+
+def as_numpy(value):
+    return onp.asarray(qml.math.toarray(qml.math.detach(value)))
+
+
+def as_trainable(values):
+
+    return np.array(values, requires_grad=True)
+
+
+def evaluate_energy(params):
+    return float(as_numpy(energy_circuit(params)))
+
+
+def compute_hqng_quantities(params):
+
+
+    gradient = onp.zeros(NUM_PARAMS, dtype=float)
+    metric = onp.zeros((NUM_PARAMS, NUM_PARAMS), dtype=float)
+
+    for coefficient, term in zip(
+        HAMILTONIAN_COEFFICIENTS,
+        HAMILTONIAN_TERMS,
+    ):
+        term_gradient = onp.real(
+            as_numpy(SINGLE_TERM_GRADIENT_FN(params, term))
+        )
+        gradient += coefficient * term_gradient
+        metric += coefficient**2 * onp.outer(term_gradient, term_gradient)
+
+    metric /= HQNG_NORMALIZATION
+    return onp.real(gradient), onp.real(metric)
+
+
+def initial_parameters(run_index):
+
+
+    rng = onp.random.default_rng(BASE_SEED + run_index)
+    return rng.uniform(
+        INITIALIZATION_LOW,
+        INITIALIZATION_HIGH,
+        size=NUM_PARAMS,
+    )
+
+
+def report_progress(run_index, method, completed_steps):
+    if completed_steps % PROGRESS_EVERY == 0 or completed_steps == NUM_STEPS:
+        print(
+            f"run {run_index:02d} | {method:<5} | "
+            f"step {completed_steps:03d}/{NUM_STEPS}",
+            flush=True,
+        )
+
+
+def run_vg(initial_params, run_index):
+    params = as_trainable(initial_params)
+    energies = onp.empty(NUM_STEPS + 1)
+    energies[0] = evaluate_energy(params)
+
+    for step in range(1, NUM_STEPS + 1):
+        gradient = onp.real(as_numpy(ENERGY_GRADIENT_FN(params)))
+        params = as_trainable(as_numpy(params) - LEARNING_RATE * gradient)
+        energies[step] = evaluate_energy(params)
+        report_progress(run_index, "VG", step)
+
+    return energies
+
+
+def run_qng(initial_params, run_index):
+    params = as_trainable(initial_params)
+    energies = onp.empty(NUM_STEPS + 1)
+    energies[0] = evaluate_energy(params)
+
+    for step in range(1, NUM_STEPS + 1):
+        metric = onp.real(as_numpy(QNG_METRIC_FN(params)))
+        gradient = onp.real(as_numpy(ENERGY_GRADIENT_FN(params)))
+
+        direction = onp.linalg.pinv(metric) @ gradient
+        params = as_trainable(as_numpy(params) - LEARNING_RATE * direction)
+        energies[step] = evaluate_energy(params)
+        report_progress(run_index, "QNG", step)
+
+    return energies
+
+
+def run_hqng(initial_params, run_index):
+    params = as_trainable(initial_params)
+    identity = onp.eye(initial_params.size)
+    energies = onp.empty(NUM_STEPS + 1)
+    energies[0] = evaluate_energy(params)
+
+    for step in range(1, NUM_STEPS + 1):
+        gradient, metric = compute_hqng_quantities(params)
+        regularized_metric = metric + HQNG_REGULARIZATION * identity
+
+        direction = onp.linalg.solve(regularized_metric, gradient)
+        params = as_trainable(as_numpy(params) - LEARNING_RATE * direction)
+        energies[step] = evaluate_energy(params)
+        report_progress(run_index, "H-QNG", step)
+
+    return energies
+
+
+def process_run(run_index):
+
+
+    initial_params = initial_parameters(run_index)
+    print(f"run {run_index:02d} | started", flush=True)
+    onp.save(RESULTS_DIR / f"initial_params{run_index}.npy", initial_params)
+
+    print(f"run {run_index:02d} | H-QNG | started", flush=True)
+    value_hqng = run_hqng(initial_params, run_index)
+    onp.save(RESULTS_DIR / f"value_hqng{run_index}.npy", value_hqng)
+
+    print(f"run {run_index:02d} | VG | started", flush=True)
+    value_vg = run_vg(initial_params, run_index)
+    onp.save(RESULTS_DIR / f"value_vg{run_index}.npy", value_vg)
+
+    print(f"run {run_index:02d} | QNG | started", flush=True)
+    value_qng = run_qng(initial_params, run_index)
+    onp.save(RESULTS_DIR / f"value_qng{run_index}.npy", value_qng)
+
+    print(f"run {run_index:02d} | completed", flush=True)
+    return run_index
+
+
+def main():
+    start_time = time.perf_counter()
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"LiH FCI energy: {FCI_ENERGY}")
+    print(f"Number of parameters: {NUM_PARAMS}")
+    print(f"Number of Hamiltonian terms: {len(HAMILTONIAN_TERMS)}")
+    print(
+        "Initialization: independent Uniform"
+        f"([{INITIALIZATION_LOW:.6f}, {INITIALIZATION_HIGH:.6f}])"
+    )
+    print(f"Results directory: {RESULTS_DIR}")
+    print(f"Running {NUM_RUNS} trials with {MAX_WORKERS} worker(s).")
+
+    if NUM_RUNS == 1:
+        process_run(0)
+    else:
+        failures = []
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(process_run, run_index): run_index
+                for run_index in range(NUM_RUNS)
+            }
+            for future in as_completed(futures):
+                run_index = futures[future]
+                try:
+                    future.result()
+                except Exception as error:
+                    failures.append((run_index, error))
+                    print(f"run {run_index:02d} | failed: {error}", flush=True)
+
+        if failures:
+            failed_runs = ", ".join(str(index) for index, _ in failures)
+            raise RuntimeError(f"LiH experiment failed for run(s): {failed_runs}")
+
+    elapsed = time.perf_counter() - start_time
+    print(f"Total time: {elapsed:.2f} seconds")
+
 
 if __name__ == "__main__":
-    runs = list(range(1))
-        
-    with ProcessPoolExecutor() as executor:
-        futures = {executor.submit(process, run): run for run in runs}
-
-        for future in as_completed(futures):
-            run = futures[future]
-            try:
-                result = future.result()
-                print(result)  
-            except Exception as e:
-                print(f"Run {run} generated an exception: {e}")
-
-
-t2= time.time()
-
-print('total time:')
-print(t2-t1)
-
-
-
-
+    main()
